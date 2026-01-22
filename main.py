@@ -5,17 +5,19 @@ from fastapi import FastAPI, HTTPException, Header, Response
 from pydantic import BaseModel, Field
 from typing import Union
 
-# --- LOGGING (Para você ver o que acontece nos logs do Railway) ---
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ProxyLogger")
 
-app = FastAPI(title="Clinicorp Type-Fix Proxy", version="1.1.0")
+app = FastAPI(title="Clinicorp Type-Fix Proxy", version="1.2.0")
 
 CLINICORP_URL = "https://api.clinicorp.com/rest/v1/appointment/cancel_appointment"
 
+# --- MODELO DE DADOS CORRIGIDO ---
+# Agora reflete exatamente o JSON que o Aikortex envia
 class AikortexPayload(BaseModel):
-    # Aceita string ou int, converte para o que precisamos
-    id_agendamento: Union[int, str] = Field(..., description="ID do agendamento")
+    subscriber_id: Union[int, str] = Field(..., description="ID ou Slug da Clínica (ex: odontomaria)")
+    id: Union[int, str] = Field(..., description="ID do Agendamento (vem como string, sai como int)")
 
 @app.get("/")
 async def health_check():
@@ -24,7 +26,7 @@ async def health_check():
 @app.post("/proxy/cancel")
 async def cancel_appointment(
     payload: AikortexPayload,
-    response: Response, # Injeção para manipular o Status Code
+    response: Response,
     x_proxy_secret: Union[str, None] = Header(default=None, alias="X-Proxy-Secret")
 ):
     # 1. Validação de Ambiente
@@ -33,16 +35,25 @@ async def cancel_appointment(
         logger.error("Token da Clinicorp não configurado.")
         raise HTTPException(status_code=500, detail="Server Error: Token not configured")
 
-    # 2. Tratamento de Tipos (String -> Int)
+    # 2. Tratamento de Tipos (A MÁGICA ACONTECE AQUI)
     try:
-        clean_id = int(payload.id_agendamento)
+        # Forçamos o ID do agendamento ser um INTEIRO
+        clean_appointment_id = int(payload.id)
+        
+        # O subscriber_id pode ser string ("odontomaria") ou int. 
+        # Se for numérico (string com números), convertemos para int para garantir.
+        # Se for texto (slug), mantemos texto.
+        clean_subscriber_id = payload.subscriber_id
+        if isinstance(clean_subscriber_id, str) and clean_subscriber_id.isdigit():
+            clean_subscriber_id = int(clean_subscriber_id)
+            
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"O ID informado '{payload.id_agendamento}' não é um número válido.")
+        raise HTTPException(status_code=400, detail=f"O ID informado '{payload.id}' não é válido.")
 
-    # 3. Payload Destino
+    # 3. Montagem do Payload Destino (O que a Clinicorp vai receber)
     dest_payload = {
-        "subscriber_id": clean_id,
-        "id": clean_id
+        "subscriber_id": clean_subscriber_id,
+        "id": clean_appointment_id # Aqui vai sem aspas: 12345
     }
 
     headers = {
@@ -51,43 +62,43 @@ async def cancel_appointment(
         "Content-Type": "application/json"
     }
 
-    logger.info(f"Enviando requisicao para Clinicorp. ID: {clean_id}")
+    logger.info(f"Enviando para Clinicorp -> ID: {clean_appointment_id} | Sub: {clean_subscriber_id}")
 
-    # 4. Envio com Tratamento de Erro Robusto
+    # 4. Envio da Requisição
     async with httpx.AsyncClient() as client:
         try:
             upstream_resp = await client.post(
                 CLINICORP_URL,
-                json=dest_payload,
+                json=dest_payload, # json=... serializa automaticamente para JSON correto
                 headers=headers,
-                timeout=15.0 # Aumentei um pouco o timeout por segurança
+                timeout=15.0
             )
             
-            # --- AQUI ESTÁ A MUDANÇA ---
-            
-            # 1. Espelhamos o Status Code da Clinicorp (Se der 400 lá, dá 400 aqui)
+            # Espelha o status code da Clinicorp
             response.status_code = upstream_resp.status_code
             
-            # 2. Tentamos ler o JSON de erro original
             try:
                 upstream_data = upstream_resp.json()
             except Exception:
-                # Se não for JSON (ex: erro 500 do Nginx deles), devolvemos o texto cru
                 logger.warning("Resposta da Clinicorp não é JSON válido.")
                 upstream_data = {"raw_error": upstream_resp.text}
 
-            # 3. Retornamos tudo para o Aikortex analisar
             return {
-                "status": "completed", # Indica que o proxy rodou
+                "status": "completed",
                 "clinicorp_status": upstream_resp.status_code,
-                "error": upstream_data if upstream_resp.is_error else None, # Campo explícito de erro
-                "data": upstream_data # Dados completos
+                "sent_payload": dest_payload, # Debug: mostra o que enviamos de fato
+                "error": upstream_data if upstream_resp.is_error else None,
+                "data": upstream_data
             }
 
         except httpx.TimeoutException:
-            logger.error("Timeout ao conectar na Clinicorp")
-            raise HTTPException(status_code=504, detail="Erro: A Clinicorp demorou muito para responder (Gateway Timeout).")
-            
+            logger.error("Timeout Clinicorp")
+            raise HTTPException(status_code=504, detail="Gateway Timeout (Clinicorp)")
         except httpx.RequestError as e:
-            logger.error(f"Erro de conexão: {str(e)}")
-            raise HTTPException(status_code=502, detail=f"Erro de Conexão com Clinicorp: {str(e)}")
+            logger.error(f"Erro Conexão: {str(e)}")
+            raise HTTPException(status_code=502, detail=f"Erro Conexão: {str(e)}")
+
+# Configuração para rodar localmente
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
